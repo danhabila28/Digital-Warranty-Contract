@@ -1,0 +1,240 @@
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant ERR_NOT_AUTHORIZED (err u100))
+(define-constant ERR_PRODUCT_NOT_FOUND (err u101))
+(define-constant ERR_WARRANTY_EXPIRED (err u102))
+(define-constant ERR_CLAIM_NOT_FOUND (err u103))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u104))
+(define-constant ERR_INVALID_WARRANTY_PERIOD (err u105))
+(define-constant ERR_PRODUCT_ALREADY_EXISTS (err u106))
+
+(define-data-var next-product-id uint u1)
+(define-data-var next-claim-id uint u1)
+
+(define-map products
+  { product-id: uint }
+  {
+    name: (string-ascii 100),
+    manufacturer: principal,
+    warranty-period-blocks: uint,
+    price: uint,
+    active: bool
+  }
+)
+
+(define-map purchases
+  { product-id: uint, buyer: principal }
+  {
+    purchase-block: uint,
+    warranty-expires: uint,
+    purchase-price: uint
+  }
+)
+
+(define-map warranty-claims
+  { claim-id: uint }
+  {
+    product-id: uint,
+    claimant: principal,
+    claim-block: uint,
+    description: (string-ascii 500),
+    status: (string-ascii 20),
+    resolution: (optional (string-ascii 500))
+  }
+)
+
+(define-read-only (get-product (product-id uint))
+  (map-get? products { product-id: product-id })
+)
+
+(define-read-only (get-purchase (product-id uint) (buyer principal))
+  (map-get? purchases { product-id: product-id, buyer: buyer })
+)
+
+(define-read-only (get-warranty-claim (claim-id uint))
+  (map-get? warranty-claims { claim-id: claim-id })
+)
+
+(define-read-only (is-warranty-valid (product-id uint) (buyer principal))
+  (match (get-purchase product-id buyer)
+    purchase-data
+    (let ((warranty-expires (get warranty-expires purchase-data)))
+      (>= warranty-expires stacks-block-height))
+    false
+  )
+)
+
+(define-read-only (get-warranty-status (product-id uint) (buyer principal))
+  (match (get-purchase product-id buyer)
+    purchase-data
+    (let 
+      (
+        (warranty-expires (get warranty-expires purchase-data))
+        (blocks-remaining (if (>= warranty-expires stacks-block-height) 
+                           (- warranty-expires stacks-block-height) 
+                           u0))
+      )
+      (some {
+        purchase-block: (get purchase-block purchase-data),
+        warranty-expires: warranty-expires,
+        blocks-remaining: blocks-remaining,
+        is-active: (>= warranty-expires stacks-block-height),
+        purchase-price: (get purchase-price purchase-data)
+      })
+    )
+    none
+  )
+)
+
+(define-read-only (get-next-product-id)
+  (var-get next-product-id)
+)
+
+(define-read-only (get-next-claim-id)
+  (var-get next-claim-id)
+)
+
+(define-public (register-product 
+  (name (string-ascii 100))
+  (warranty-period-blocks uint)
+  (price uint)
+)
+  (let ((product-id (var-get next-product-id)))
+    (asserts! (> warranty-period-blocks u0) ERR_INVALID_WARRANTY_PERIOD)
+    (asserts! (is-none (get-product product-id)) ERR_PRODUCT_ALREADY_EXISTS)
+    
+    (map-set products
+      { product-id: product-id }
+      {
+        name: name,
+        manufacturer: tx-sender,
+        warranty-period-blocks: warranty-period-blocks,
+        price: price,
+        active: true
+      }
+    )
+    
+    (var-set next-product-id (+ product-id u1))
+    (ok product-id)
+  )
+)
+
+(define-public (purchase-product (product-id uint))
+  (match (get-product product-id)
+    product-data
+    (let 
+      (
+        (warranty-expires (+ stacks-block-height (get warranty-period-blocks product-data)))
+        (price (get price product-data))
+      )
+      (asserts! (get active product-data) ERR_PRODUCT_NOT_FOUND)
+      
+      (try! (stx-transfer? price tx-sender (get manufacturer product-data)))
+      
+      (map-set purchases
+        { product-id: product-id, buyer: tx-sender }
+        {
+          purchase-block: stacks-block-height,
+          warranty-expires: warranty-expires,
+          purchase-price: price
+        }
+      )
+      
+      (ok {
+        product-id: product-id,
+        warranty-expires: warranty-expires,
+        purchase-price: price
+      })
+    )
+    ERR_PRODUCT_NOT_FOUND
+  )
+)
+
+(define-public (file-warranty-claim 
+  (product-id uint)
+  (description (string-ascii 500))
+)
+  (let ((claim-id (var-get next-claim-id)))
+    (asserts! (is-warranty-valid product-id tx-sender) ERR_WARRANTY_EXPIRED)
+    
+    (map-set warranty-claims
+      { claim-id: claim-id }
+      {
+        product-id: product-id,
+        claimant: tx-sender,
+        claim-block: stacks-block-height,
+        description: description,
+        status: "pending",
+        resolution: none
+      }
+    )
+    
+    (var-set next-claim-id (+ claim-id u1))
+    (ok claim-id)
+  )
+)
+
+(define-public (process-warranty-claim 
+  (claim-id uint)
+  (status (string-ascii 20))
+  (resolution (string-ascii 500))
+)
+  (match (get-warranty-claim claim-id)
+    claim-data
+    (let ((product-id (get product-id claim-data)))
+      (match (get-product product-id)
+        product-data
+        (begin
+          (asserts! (is-eq tx-sender (get manufacturer product-data)) ERR_NOT_AUTHORIZED)
+          (asserts! (is-eq (get status claim-data) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+          
+          (map-set warranty-claims
+            { claim-id: claim-id }
+            (merge claim-data {
+              status: status,
+              resolution: (some resolution)
+            })
+          )
+          
+          (ok true)
+        )
+        ERR_PRODUCT_NOT_FOUND
+      )
+    )
+    ERR_CLAIM_NOT_FOUND
+  )
+)
+
+(define-public (deactivate-product (product-id uint))
+  (match (get-product product-id)
+    product-data
+    (begin
+      (asserts! (is-eq tx-sender (get manufacturer product-data)) ERR_NOT_AUTHORIZED)
+      
+      (map-set products
+        { product-id: product-id }
+        (merge product-data { active: false })
+      )
+      
+      (ok true)
+    )
+    ERR_PRODUCT_NOT_FOUND
+  )
+)
+
+(define-public (update-product-price (product-id uint) (new-price uint))
+  (match (get-product product-id)
+    product-data
+    (begin
+      (asserts! (is-eq tx-sender (get manufacturer product-data)) ERR_NOT_AUTHORIZED)
+      (asserts! (get active product-data) ERR_PRODUCT_NOT_FOUND)
+      
+      (map-set products
+        { product-id: product-id }
+        (merge product-data { price: new-price })
+      )
+      
+      (ok true)
+    )
+    ERR_PRODUCT_NOT_FOUND
+  )
+)
