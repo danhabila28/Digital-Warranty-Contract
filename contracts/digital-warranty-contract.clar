@@ -6,6 +6,8 @@
 (define-constant ERR_CLAIM_ALREADY_PROCESSED (err u104))
 (define-constant ERR_INVALID_WARRANTY_PERIOD (err u105))
 (define-constant ERR_PRODUCT_ALREADY_EXISTS (err u106))
+(define-constant ERR_TRANSFER_NOT_AUTHORIZED (err u107))
+(define-constant ERR_TRANSFER_TO_SELF (err u108))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-claim-id uint u1)
@@ -39,6 +41,15 @@
     description: (string-ascii 500),
     status: (string-ascii 20),
     resolution: (optional (string-ascii 500))
+  }
+)
+
+(define-map warranty-transfers
+  { product-id: uint, transfer-block: uint }
+  {
+    from-owner: principal,
+    to-owner: principal,
+    transfer-price: uint
   }
 )
 
@@ -91,6 +102,14 @@
 
 (define-read-only (get-next-claim-id)
   (var-get next-claim-id)
+)
+
+(define-read-only (get-current-warranty-owner (product-id uint))
+  (match (get-product product-id)
+    product-data
+    (some (get manufacturer product-data))
+    none
+  )
 )
 
 (define-public (register-product 
@@ -236,5 +255,36 @@
       (ok true)
     )
     ERR_PRODUCT_NOT_FOUND
+  )
+)
+
+(define-public (transfer-warranty (product-id uint) (to-owner principal) (transfer-price uint))
+  (let ((current-owner tx-sender))
+    (asserts! (not (is-eq current-owner to-owner)) ERR_TRANSFER_TO_SELF)
+    (asserts! (is-warranty-valid product-id current-owner) ERR_WARRANTY_EXPIRED)
+    
+    (try! (stx-transfer? transfer-price to-owner current-owner))
+    
+    (map-set warranty-transfers
+      { product-id: product-id, transfer-block: stacks-block-height }
+      {
+        from-owner: current-owner,
+        to-owner: to-owner,
+        transfer-price: transfer-price
+      }
+    )
+    
+    (match (get-purchase product-id current-owner)
+      purchase-data
+      (begin
+        (map-delete purchases { product-id: product-id, buyer: current-owner })
+        (map-set purchases
+          { product-id: product-id, buyer: to-owner }
+          purchase-data
+        )
+        (ok true)
+      )
+      ERR_PRODUCT_NOT_FOUND
+    )
   )
 )
