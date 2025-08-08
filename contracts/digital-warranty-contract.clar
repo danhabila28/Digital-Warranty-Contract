@@ -8,6 +8,8 @@
 (define-constant ERR_PRODUCT_ALREADY_EXISTS (err u106))
 (define-constant ERR_TRANSFER_NOT_AUTHORIZED (err u107))
 (define-constant ERR_TRANSFER_TO_SELF (err u108))
+(define-constant ERR_EXTENSION_NOT_ALLOWED (err u109))
+(define-constant ERR_INVALID_EXTENSION_PERIOD (err u110))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-claim-id uint u1)
@@ -53,6 +55,15 @@
   }
 )
 
+(define-map warranty-extensions
+  { product-id: uint, buyer: principal, extension-block: uint }
+  {
+    extension-blocks: uint,
+    extension-cost: uint,
+    new-expiry: uint
+  }
+)
+
 (define-read-only (get-product (product-id uint))
   (map-get? products { product-id: product-id })
 )
@@ -68,9 +79,18 @@
 (define-read-only (is-warranty-valid (product-id uint) (buyer principal))
   (match (get-purchase product-id buyer)
     purchase-data
-    (let ((warranty-expires (get warranty-expires purchase-data)))
-      (>= warranty-expires stacks-block-height))
+    (let ((base-expiry (get warranty-expires purchase-data))
+          (extended-expiry (get-extended-warranty-expiry product-id buyer)))
+      (>= extended-expiry stacks-block-height))
     false
+  )
+)
+
+(define-read-only (get-extended-warranty-expiry (product-id uint) (buyer principal))
+  (match (get-purchase product-id buyer)
+    purchase-data
+    (get warranty-expires purchase-data)
+    u0
   )
 )
 
@@ -110,6 +130,20 @@
     (some (get manufacturer product-data))
     none
   )
+)
+
+(define-read-only (calculate-extension-cost (product-id uint) (extension-blocks uint))
+  (match (get-product product-id)
+    product-data
+    (let ((base-price (get price product-data)))
+      (/ (* base-price extension-blocks) (get warranty-period-blocks product-data))
+    )
+    u0
+  )
+)
+
+(define-read-only (get-warranty-extension (product-id uint) (buyer principal) (extension-block uint))
+  (map-get? warranty-extensions { product-id: product-id, buyer: buyer, extension-block: extension-block })
 )
 
 (define-public (register-product 
@@ -283,6 +317,47 @@
           purchase-data
         )
         (ok true)
+      )
+      ERR_PRODUCT_NOT_FOUND
+    )
+  )
+)
+
+(define-public (extend-warranty (product-id uint) (extension-blocks uint))
+  (let 
+    (
+      (extension-cost (calculate-extension-cost product-id extension-blocks))
+      (current-purchase (unwrap! (get-purchase product-id tx-sender) ERR_PRODUCT_NOT_FOUND))
+      (current-expiry (get warranty-expires current-purchase))
+      (new-expiry (+ current-expiry extension-blocks))
+    )
+    (asserts! (> extension-blocks u0) ERR_INVALID_EXTENSION_PERIOD)
+    (asserts! (>= current-expiry stacks-block-height) ERR_EXTENSION_NOT_ALLOWED)
+    
+    (match (get-product product-id)
+      product-data
+      (begin
+        (try! (stx-transfer? extension-cost tx-sender (get manufacturer product-data)))
+        
+        (map-set warranty-extensions
+          { product-id: product-id, buyer: tx-sender, extension-block: stacks-block-height }
+          {
+            extension-blocks: extension-blocks,
+            extension-cost: extension-cost,
+            new-expiry: new-expiry
+          }
+        )
+        
+        (map-set purchases
+          { product-id: product-id, buyer: tx-sender }
+          (merge current-purchase { warranty-expires: new-expiry })
+        )
+        
+        (ok {
+          extension-blocks: extension-blocks,
+          extension-cost: extension-cost,
+          new-expiry: new-expiry
+        })
       )
       ERR_PRODUCT_NOT_FOUND
     )
