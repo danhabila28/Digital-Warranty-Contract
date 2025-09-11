@@ -10,6 +10,9 @@
 (define-constant ERR_TRANSFER_TO_SELF (err u108))
 (define-constant ERR_EXTENSION_NOT_ALLOWED (err u109))
 (define-constant ERR_INVALID_EXTENSION_PERIOD (err u110))
+(define-constant ERR_INVALID_SERIAL (err u111))
+(define-constant ERR_SERIAL_ALREADY_EXISTS (err u112))
+(define-constant ERR_SERIAL_NOT_FOUND (err u113))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-claim-id uint u1)
@@ -61,6 +64,26 @@
     extension-blocks: uint,
     extension-cost: uint,
     new-expiry: uint
+  }
+)
+
+(define-map product-serials
+  { serial-number: (string-ascii 64) }
+  {
+    product-id: uint,
+    manufacturer: principal,
+    is-authentic: bool,
+    creation-block: uint
+  }
+)
+
+(define-map serial-purchases
+  { serial-number: (string-ascii 64) }
+  {
+    buyer: principal,
+    purchase-block: uint,
+    warranty-expires: uint,
+    purchase-price: uint
   }
 )
 
@@ -144,6 +167,30 @@
 
 (define-read-only (get-warranty-extension (product-id uint) (buyer principal) (extension-block uint))
   (map-get? warranty-extensions { product-id: product-id, buyer: buyer, extension-block: extension-block })
+)
+
+(define-read-only (get-product-serial (serial-number (string-ascii 64)))
+  (map-get? product-serials { serial-number: serial-number })
+)
+
+(define-read-only (get-serial-purchase (serial-number (string-ascii 64)))
+  (map-get? serial-purchases { serial-number: serial-number })
+)
+
+(define-read-only (verify-serial-authenticity (serial-number (string-ascii 64)))
+  (match (get-product-serial serial-number)
+    serial-data
+    (get is-authentic serial-data)
+    false
+  )
+)
+
+(define-read-only (is-serial-warranty-valid (serial-number (string-ascii 64)))
+  (match (get-serial-purchase serial-number)
+    purchase-data
+    (>= (get warranty-expires purchase-data) stacks-block-height)
+    false
+  )
 )
 
 (define-public (register-product 
@@ -360,6 +407,99 @@
         })
       )
       ERR_PRODUCT_NOT_FOUND
+    )
+  )
+)
+
+(define-public (generate-product-serial (product-id uint) (serial-number (string-ascii 64)))
+  (match (get-product product-id)
+    product-data
+    (begin
+      (asserts! (is-eq tx-sender (get manufacturer product-data)) ERR_NOT_AUTHORIZED)
+      (asserts! (is-none (get-product-serial serial-number)) ERR_SERIAL_ALREADY_EXISTS)
+      (asserts! (> (len serial-number) u0) ERR_INVALID_SERIAL)
+      
+      (map-set product-serials
+        { serial-number: serial-number }
+        {
+          product-id: product-id,
+          manufacturer: tx-sender,
+          is-authentic: true,
+          creation-block: stacks-block-height
+        }
+      )
+      
+      (ok serial-number)
+    )
+    ERR_PRODUCT_NOT_FOUND
+  )
+)
+
+(define-public (purchase-with-serial (serial-number (string-ascii 64)))
+  (let ((serial-data (unwrap! (get-product-serial serial-number) ERR_SERIAL_NOT_FOUND)))
+    (asserts! (get is-authentic serial-data) ERR_INVALID_SERIAL)
+    (asserts! (is-none (get-serial-purchase serial-number)) ERR_SERIAL_ALREADY_EXISTS)
+    
+    (match (get-product (get product-id serial-data))
+      product-data
+      (let 
+        (
+          (warranty-expires (+ stacks-block-height (get warranty-period-blocks product-data)))
+          (price (get price product-data))
+        )
+        (asserts! (get active product-data) ERR_PRODUCT_NOT_FOUND)
+        
+        (try! (stx-transfer? price tx-sender (get manufacturer product-data)))
+        
+        (map-set serial-purchases
+          { serial-number: serial-number }
+          {
+            buyer: tx-sender,
+            purchase-block: stacks-block-height,
+            warranty-expires: warranty-expires,
+            purchase-price: price
+          }
+        )
+        
+        (ok {
+          serial-number: serial-number,
+          warranty-expires: warranty-expires,
+          purchase-price: price
+        })
+      )
+      ERR_PRODUCT_NOT_FOUND
+    )
+  )
+)
+
+(define-public (verify-and-claim (serial-number (string-ascii 64)) (description (string-ascii 500)))
+  (let ((claim-id (var-get next-claim-id)))
+    (asserts! (verify-serial-authenticity serial-number) ERR_INVALID_SERIAL)
+    (asserts! (is-serial-warranty-valid serial-number) ERR_WARRANTY_EXPIRED)
+    
+    (match (get-serial-purchase serial-number)
+      purchase-data
+      (begin
+        (asserts! (is-eq tx-sender (get buyer purchase-data)) ERR_NOT_AUTHORIZED)
+        
+        (let ((serial-info (unwrap-panic (get-product-serial serial-number))))
+          (map-set warranty-claims
+            { claim-id: claim-id }
+            {
+              product-id: (get product-id serial-info),
+              claimant: tx-sender,
+              claim-block: stacks-block-height,
+              description: description,
+              status: "pending",
+              resolution: none
+            }
+          )
+        )
+        
+        (var-set next-claim-id (+ claim-id u1))
+        (ok claim-id)
+      )
+      ERR_SERIAL_NOT_FOUND
     )
   )
 )
