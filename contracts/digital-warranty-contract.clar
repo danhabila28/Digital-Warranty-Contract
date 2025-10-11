@@ -13,6 +13,9 @@
 (define-constant ERR_INVALID_SERIAL (err u111))
 (define-constant ERR_SERIAL_ALREADY_EXISTS (err u112))
 (define-constant ERR_SERIAL_NOT_FOUND (err u113))
+(define-constant ERR_REFUND_PERIOD_EXPIRED (err u114))
+(define-constant ERR_ALREADY_REFUNDED (err u115))
+(define-constant ERR_NO_REFUND_POLICY (err u116))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-claim-id uint u1)
@@ -24,7 +27,8 @@
     manufacturer: principal,
     warranty-period-blocks: uint,
     price: uint,
-    active: bool
+    active: bool,
+    refund-grace-blocks: uint
   }
 )
 
@@ -84,6 +88,15 @@
     purchase-block: uint,
     warranty-expires: uint,
     purchase-price: uint
+  }
+)
+
+(define-map product-refunds
+  { product-id: uint, buyer: principal }
+  {
+    refund-block: uint,
+    refund-amount: uint,
+    refunded: bool
   }
 )
 
@@ -193,10 +206,38 @@
   )
 )
 
+(define-read-only (get-refund-status (product-id uint) (buyer principal))
+  (map-get? product-refunds { product-id: product-id, buyer: buyer })
+)
+
+(define-read-only (is-refund-eligible (product-id uint) (buyer principal))
+  (match (get-purchase product-id buyer)
+    purchase-data
+    (match (get-product product-id)
+      product-data
+      (let 
+        (
+          (grace-blocks (get refund-grace-blocks product-data))
+          (purchase-block (get purchase-block purchase-data))
+          (refund-deadline (+ purchase-block grace-blocks))
+        )
+        (and 
+          (> grace-blocks u0)
+          (<= stacks-block-height refund-deadline)
+          (is-none (get-refund-status product-id buyer))
+        )
+      )
+      false
+    )
+    false
+  )
+)
+
 (define-public (register-product 
   (name (string-ascii 100))
   (warranty-period-blocks uint)
   (price uint)
+  (refund-grace-blocks uint)
 )
   (let ((product-id (var-get next-product-id)))
     (asserts! (> warranty-period-blocks u0) ERR_INVALID_WARRANTY_PERIOD)
@@ -209,7 +250,8 @@
         manufacturer: tx-sender,
         warranty-period-blocks: warranty-period-blocks,
         price: price,
-        active: true
+        active: true,
+        refund-grace-blocks: refund-grace-blocks
       }
     )
     
@@ -500,6 +542,42 @@
         (ok claim-id)
       )
       ERR_SERIAL_NOT_FOUND
+    )
+  )
+)
+
+(define-public (request-product-refund (product-id uint))
+  (let 
+    (
+      (purchase-data (unwrap! (get-purchase product-id tx-sender) ERR_PRODUCT_NOT_FOUND))
+      (product-data (unwrap! (get-product product-id) ERR_PRODUCT_NOT_FOUND))
+    )
+    (asserts! (is-none (get-refund-status product-id tx-sender)) ERR_ALREADY_REFUNDED)
+    (asserts! (is-refund-eligible product-id tx-sender) ERR_REFUND_PERIOD_EXPIRED)
+    
+    (let 
+      (
+        (refund-amount (get purchase-price purchase-data))
+        (manufacturer (get manufacturer product-data))
+      )
+      (try! (stx-transfer? refund-amount manufacturer tx-sender))
+      
+      (map-set product-refunds
+        { product-id: product-id, buyer: tx-sender }
+        {
+          refund-block: stacks-block-height,
+          refund-amount: refund-amount,
+          refunded: true
+        }
+      )
+      
+      (map-delete purchases { product-id: product-id, buyer: tx-sender })
+      
+      (ok {
+        product-id: product-id,
+        refund-amount: refund-amount,
+        refund-block: stacks-block-height
+      })
     )
   )
 )
