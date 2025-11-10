@@ -17,6 +17,11 @@
 (define-constant ERR_ALREADY_REFUNDED (err u115))
 (define-constant ERR_NO_REFUND_POLICY (err u116))
 
+(define-constant ERR_ALREADY_PAUSED (err u117))
+(define-constant ERR_NOT_PAUSED (err u118))
+(define-constant ERR_PAUSE_LIMIT_EXCEEDED (err u119))
+(define-constant MAX_PAUSE_BLOCKS u10000)
+
 (define-data-var next-product-id uint u1)
 (define-data-var next-claim-id uint u1)
 
@@ -97,6 +102,15 @@
     refund-block: uint,
     refund-amount: uint,
     refunded: bool
+  }
+)
+
+(define-map warranty-pauses
+  { product-id: uint, buyer: principal }
+  {
+    is-paused: bool,
+    pause-start-block: uint,
+    total-paused-blocks: uint
   }
 )
 
@@ -210,6 +224,10 @@
   (map-get? product-refunds { product-id: product-id, buyer: buyer })
 )
 
+(define-read-only (get-pause-status (product-id uint) (buyer principal))
+  (map-get? warranty-pauses { product-id: product-id, buyer: buyer })
+)
+
 (define-read-only (is-refund-eligible (product-id uint) (buyer principal))
   (match (get-purchase product-id buyer)
     purchase-data
@@ -230,6 +248,51 @@
       false
     )
     false
+  )
+)
+
+(define-public (pause-warranty (product-id uint))
+  (let 
+    (
+      (purchase-data (unwrap! (get-purchase product-id tx-sender) ERR_PRODUCT_NOT_FOUND))
+      (current-expiry (get warranty-expires purchase-data))
+      (existing (get-pause-status product-id tx-sender))
+      (prev-total (match existing d (get total-paused-blocks d) u0))
+    )
+    (asserts! (>= current-expiry stacks-block-height) ERR_WARRANTY_EXPIRED)
+    (match existing
+      pause-data
+      (asserts! (not (get is-paused pause-data)) ERR_ALREADY_PAUSED)
+      true
+    )
+    (map-set warranty-pauses
+      { product-id: product-id, buyer: tx-sender }
+      {
+        is-paused: true,
+        pause-start-block: stacks-block-height,
+        total-paused-blocks: prev-total
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (resume-warranty (product-id uint))
+  (let 
+    (
+      (pause-data (unwrap! (get-pause-status product-id tx-sender) ERR_NOT_PAUSED))
+      (purchase-data (unwrap! (get-purchase product-id tx-sender) ERR_PRODUCT_NOT_FOUND))
+      (start (get pause-start-block pause-data))
+      (elapsed (if (> stacks-block-height start) (- stacks-block-height start) u0))
+      (new-total (+ (get total-paused-blocks pause-data) elapsed))
+      (current-expiry (get warranty-expires purchase-data))
+      (new-expiry (+ current-expiry elapsed))
+    )
+    (asserts! (get is-paused pause-data) ERR_NOT_PAUSED)
+    (asserts! (<= new-total MAX_PAUSE_BLOCKS) ERR_PAUSE_LIMIT_EXCEEDED)
+    (map-set purchases { product-id: product-id, buyer: tx-sender } (merge purchase-data { warranty-expires: new-expiry }))
+    (map-set warranty-pauses { product-id: product-id, buyer: tx-sender } { is-paused: false, pause-start-block: u0, total-paused-blocks: new-total })
+    (ok { new-expiry: new-expiry, total-paused-blocks: new-total })
   )
 )
 
